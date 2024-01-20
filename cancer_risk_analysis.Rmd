@@ -1,0 +1,413 @@
+---
+title: "Colorectal Cancer in Wisconsin"
+author: "Joule Voelz"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Load and join data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load required packages.
+
+```{r, echo=TRUE, message=FALSE}
+library(foreign)  
+library(gdata)  
+library(sp)
+library(sf)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(SpatialEpi)
+library(spdep)
+library(INLA)
+library(texreg)
+library(stargazer)
+library(xtable)
+library(spdep)
+```
+
+Load Wisconsin shapefile downloaded from https://data-wi-dnr.opendata.arcgis.com/datasets/wi-dnr::county-boundaries-24k/about 
+
+```{r, echo=TRUE,message=FALSE}
+map <- st_read(
+  "County_Boundaries_24K/County_Boundaries_24K.shp")
+map <- st_as_sf(map)
+```
+Read in cleaned data.
+
+```{r, echo=TRUE, message=FALSE}
+covariates <- read_csv("data/data_cleaned/covariates.csv")
+incidence <- read_csv("data/data_cleaned/incidence.csv")
+mortality <- read_csv("data/data_cleaned/mortality.csv")
+pop <- read_csv("data/data_cleaned/pop.csv")
+land_area <- read_csv("data/data_cleaned/land_area.csv")
+```
+Join data to the map.
+
+```{r}
+map <- map %>% 
+  merge(covariates,by.x=c("COUNTY_NAM"), by.y=c("County")) %>%
+  merge(incidence,by.x=c("COUNTY_NAM"), by.y=c("County")) %>%
+  merge(mortality,by.x=c("COUNTY_NAM"), by.y=c("County")) %>%
+  merge(pop,by.x=c("COUNTY_NAM"), by.y=c("County")) %>%
+  merge(land_area,by.x=c("COUNTY_NAM"), by.y=c("County"))
+```
+
+
+# Calculate expected cases and mortality
+
+Calculate some statistics about statewide cases and mortality.
+
+```{r}
+wis_incidence <- incidence %>%
+  filter(County == "Wisconsin")
+
+wis_mortality <- mortality %>%
+  filter(County == "Wisconsin")
+
+wis_pop <- pop %>%
+  filter(County == "Wisconsin")
+
+wis_rate_all <- (wis_incidence["incidence_all"]/wis_pop["pop_all_adults"])[1,1]
+wis_rate_under_65 <- (wis_incidence["incidence_under_65"]/wis_pop["pop_under_65"])[1,1]
+wis_rate_65_over <- (wis_incidence["incidence_65_over"]/wis_pop["pop_65_over"])[1,1]
+
+wis_mortality_rate_65_over <- (wis_mortality["mortality_65_over"]/wis_pop["pop_65_over"])[1,1]
+
+wis_mortality_rate <- (wis_mortality["mortality_all"]/wis_pop["pop_all_adults"])[1,1]
+```
+
+Calculate expected cases and mortality.
+
+```{r}
+map$E_cases <- map$pop_under_65 * wis_rate_under_65 + map$pop_65_over * wis_rate_65_over
+
+map$E_mortality_65_over <- map$pop_65_over * wis_mortality_rate_65_over
+
+map$E_mortality_all <- map$pop_all_adults * wis_mortality_rate
+```
+
+Calculate SIR and SMR for each county.
+
+```{r}
+map$SIR <- map$incidence_all / map$E_cases
+map$SMR_65_over <- map$mortality_65_over / map$E_mortality_65_over
+map$SMR_all <- map$mortality_all / map$E_mortality_all
+```
+
+# Prepare and run models using INLA
+
+Create neighborhood matrix and graph for INLA.
+
+```{r}
+nb <- poly2nb(map)
+```
+
+```{r}
+nb2INLA("map.adj", nb)
+g <- inla.read.graph(filename = "map.adj")
+```
+
+Set random effects.
+
+```{r}
+map$re_u <- 1:nrow(map)
+map$re_v <- 1:nrow(map)
+```
+
+Create formula for model.
+
+```{r}
+formula <- incidence_all ~ smokers_ever + poverty + endoscopy + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+```
+
+Create mask to exclude missing data points.
+
+```{r}
+mask <- !is.na(map$incidence_all)
+```
+
+Run INLA model.
+
+```{r, echo=FALSE}
+res <- inla(formula, family = "poisson", data = filter(map, !is.na(incidence_all)), E = E_cases, control.predictor = list(compute = TRUE))
+```
+```{r}
+summary(res)
+```
+```{r}
+xtable(res$summary.fixed[,c(1,2,3,5)], caption="Fitted coefficients", label="coefs",digits=3)
+```
+
+Plot coefficients.
+
+```{r}
+marginal <- inla.smarginal(res$marginals.fixed$endoscopy)
+marginal <- data.frame(marginal)
+ggplot(marginal, aes(x = x, y = y)) + geom_line() + labs(x = expression(beta[3]), y = "Density") +
+  geom_vline(xintercept = 0, col = "blue") + theme_bw()
+```
+
+```{r}
+marginal <- inla.smarginal(res$marginals.fixed$smokers_ever)
+marginal <- data.frame(marginal)
+ggplot(marginal, aes(x = x, y = y)) + geom_line() + labs(x = expression(beta[1]), y = "Density") +
+  geom_vline(xintercept = 0, col = "blue") + theme_bw()
+```
+```{r}
+marginal <- inla.smarginal(res$marginals.fixed$poverty)
+marginal <- data.frame(marginal)
+ggplot(marginal, aes(x = x, y = y)) + geom_line() + labs(x = expression(beta[2]), y = "Density") +
+  geom_vline(xintercept = 0, col = "blue") + theme_bw()
+```
+
+Add fitted values to map.
+
+```{r}
+head(res$summary.fitted.values)
+map$RR[mask] <- res$summary.fitted.values[, "mean"]
+#map$LL[is.na(map$incidence_all)] <- res$summary.fitted.values[, "0.025quant"]
+#map$UL[is.na(map$incidence_all)] <- res$summary.fitted.values[, "0.975quant"]
+map$RR[!mask] <- NA
+```
+
+Run the same model for mortality.
+
+```{r}
+formula_mortality <- mortality_all ~ smokers_ever + poverty + endoscopy + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+```
+```{r}
+mortality_mask <- !is.na(map$mortality_all)
+```
+
+```{r}
+res_mortality <- inla(formula_mortality, family = "poisson", data = filter(map,mortality_mask), E = E_mortality_all, control.predictor = list(compute = TRUE))
+```
+```{r}
+summary(res_mortality)
+```
+```{r}
+xtable(res_mortality$summary.fixed[,c(1,2,3,5)], caption="Fitted coefficients (Mortality)", label="coefs_mortality",digits=3)
+```
+
+```{r}
+head(res_mortality$summary.fitted.values)
+map$RR_mortality[mortality_mask] <- res_mortality$summary.fitted.values[, "mean"]
+#map$LL_mortality[mortality_mask] <- res_mortality$summary.fitted.values[, "0.025quant"]
+#map$UL_mortality[mortality_mask] <- res_mortality$summary.fitted.values[, "0.975quant"]
+map$RR_mortality[!mortality_mask] <- NA
+```
+
+# Generate maps
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = RR)) + 
+  theme_bw() +  
+  scale_fill_viridis_c(option = "C") +
+  ggtitle("Relative Risk of Colorectal Cancer Incidence (Estimated)")
+
+ggsave("figures/RR.pdf")
+```
+
+```{r, eval=FALSE}
+pdf(file="figures/error_SIR.pdf")
+plot(map$RR - map$SIR,
+     ylab = "RR - SIR",
+     main = "Error in Estimated Relative Risk (Incidence)")
+abline(h=0, col="blue")
+dev.off()
+```
+```{r, eval=FALSE}
+pdf(file="figures/error_SMR.pdf")
+plot(map$RR_mortality - map$SMR_all,
+     ylab = "RR - SMR",
+     main = "Error in Estimated Relative Risk (Mortality)")
+abline(h=0, col="blue")
+dev.off()
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = RR_mortality)) + 
+  theme_bw() +  
+  scale_fill_viridis_c(option = "C") +
+  ggtitle("Relative Risk of Mortality from Colorectal Cancer (Estimated)") +
+  labs(fill = "RR")
+
+ggsave("figures/RR_mortality.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = SIR)) + 
+  theme_bw() +  
+  scale_fill_viridis_c(option = "C") +
+  ggtitle("Standardized Incidence Ratios - Colorectal Cancer")
+
+ggsave("figures/SIR.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = SMR_65_over)) + 
+  theme_bw() +  
+  scale_fill_viridis_c(option = "C") +
+  ggtitle("Standardized Mortality Ratios - 65 and over")
+
+#ggsave("figures/SIR.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = SMR_all)) + 
+  theme_bw() +  
+  scale_fill_viridis_c(option = "C") +
+  ggtitle("Standardized Mortality Ratios") +
+  labs(fill = "SMR")
+
+ggsave("figures/SMR.pdf")
+```
+```{r}
+
+
+
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = smokers_current)) + 
+  theme_bw() +  
+  scale_fill_viridis_c(option = "A") +
+  ggtitle("Percent of Adults 18+ Who Are Currently Smokers")
+
+ggsave("figures/current_smokers.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = smokers_ever)) + 
+  theme_bw() + 
+  scale_fill_viridis_c(option = "A") +
+  ggtitle("Percent of Adults 18+ Who Have Ever Been Smokers")
+
+ggsave("figures/ever_smokers.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = poverty)) + 
+  theme_bw() + 
+  scale_fill_viridis_c(option = "A") +
+  ggtitle("Percent of Individuals Below Poverty Line")
+
+ggsave("figures/poverty.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = endoscopy)) + 
+  theme_bw() + 
+  scale_fill_viridis_c(option = "A") +
+  ggtitle("Percent of Adults 50+ Ever Received Colorectal Endoscopy")
+
+ggsave("figures/endoscopy.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = pop_65_over/pop_all_adults)) + 
+  theme_bw() + 
+  scale_fill_viridis_c(option = "D") +
+  ggtitle("Percentage of Population over 65") +
+  labs(fill = "% over 65")
+
+ggsave("figures/pop_over_65.pdf")
+```
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = log(pop_all_adults))) + 
+  theme_bw() + 
+  scale_fill_viridis_c(option = "D") +
+  ggtitle("Log Population") +
+  labs(fill = "Log Pop")
+
+ggsave("figures/pop_log.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = log(pop_all_adults/land_area))) + 
+  theme_bw() + 
+  scale_fill_viridis_c(option = "D") +
+  ggtitle("Log Population Density (All Adults)") +
+  labs(fill = "Log Pop Density")
+
+ggsave("figures/pop_density.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = pop_all_adults/SHAPEAREA)) + 
+  theme_bw() + 
+  scale_fill_viridis_c(option = "D") +
+  ggtitle("Population Density") +
+  labs(fill = "Pop Density")
+
+#ggsave("figures/pop_log.pdf")
+```
+
+```{r}
+ggplot(map) + 
+  geom_sf(aes(fill = endoscopy)) + 
+  theme_bw() + 
+  scale_fill_viridis_c(option = "A") +
+  ggtitle("Percent of Adults 50+ Ever Received Colorectal Endoscopy")
+
+ggsave("figures/endoscopy.pdf")
+```
+
+# Calculate Morans
+
+```{r}
+rownames(map) <- map$COUNTY_NAM
+nb <- poly2nb(filter(map,mask), queen = TRUE) # queen: sharing a point or a border
+nbw <- spdep::nb2listw(nb, style = "W")
+gmoran <- moran.test(filter(map,mask)$SIR, nbw)
+gmoran
+```
+
+```{r}
+pdf("figures/moran_sir.pdf")
+moran.plot(filter(map,mask)$SIR, nbw, 
+           labels = TRUE,
+           xlab = "SIR",
+           ylab = "Spatially Lagged SIR",
+           main = "Moran's I - SIR",
+           xlim=c(0.8, 1.6),
+           ylim=c(0.8, 1.6))
+dev.off()
+```
+
+```{r, eval=FALSE}
+nb <- poly2nb(filter(map,mask), queen = TRUE) # queen: sharing a point or a border
+nbw <- spdep::nb2listw(nb, style = "W")
+gmoran <- moran.test(filter(map,mask)$RR, nbw)
+gmoran
+```
+
+```{r, eval=FALSE}
+pdf("figures/moran_rr.pdf")
+moran.plot(filter(map,mask)$RR, nbw, 
+           labels = TRUE,
+           main = "Moran's I - Estimated RR (Incidence)",
+           xlab = "RR",
+           ylab = "Spatially Lagged RR",
+           xlim=c(0.8, 1.6),
+           ylim=c(0.8, 1.6))
+dev.off()
+```
